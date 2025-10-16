@@ -1,0 +1,4 @@
+fastapi
+uvicorn
+obd
+pint>=0.20
