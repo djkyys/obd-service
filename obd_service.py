@@ -3,6 +3,7 @@
 Standalone OBD-II data logging service with REST API.
 Auto-discovers available OBD commands and logs timestamped vehicle data.
 Automatically reconnects if connection is lost.
+Discovery runs in background thread for instant startup.
 """
 
 import obd
@@ -18,15 +19,15 @@ import uvicorn
 from collections import deque
 import sys
 
+# Silence python-OBD's verbose logging (must be before other imports)
+obd.logger.setLevel(logging.ERROR)
+
 # Add parent directory to path for shared config
 sys.path.insert(0, str(Path.home() / "rider-controller"))
 from config.logging_config import setup_logger
 
 # Setup logger with different name to avoid conflict with python-obd logger
 logger = setup_logger('obd_service')
-
-# Silence python-OBD's verbose logging (must be after imports)
-obd.logger.setLevel(logging.ERROR)
 
 # Configuration
 OBD_PORT = None  # Auto-detect, or "/dev/ttyUSB0"
@@ -47,7 +48,7 @@ available_commands = []  # Commands that this vehicle supports
 def discover_available_commands():
     """
     Test all OBD commands to see what this vehicle supports.
-    This runs once at startup.
+    This runs in background thread after connection.
     """
     global available_commands
     
@@ -104,7 +105,7 @@ def discover_available_commands():
     logger.info(f"Command list saved to: {discovery_file}")
 
 def init_obd():
-    """Initialize OBD connection"""
+    """Initialize OBD connection (fast - no discovery)"""
     global obd_connection
     
     try:
@@ -115,7 +116,7 @@ def init_obd():
             logger.info(f"✓ Connected to {obd_connection.port_name()}")
             logger.info(f"  Protocol: {obd_connection.protocol_name()}")
             
-            # DON'T discover commands here - do it in background thread
+            # Don't discover commands here - do it in background thread
             # This makes connection instant instead of 30+ seconds
             
             return True
@@ -232,9 +233,6 @@ def poll_obd():
     # Cleanup on exit
     is_running = False
     logger.info("OBD polling stopped")
-    
-    # Don't auto-reconnect if manually stopped
-    # (Reconnection should only happen on unexpected disconnects, not manual stops)
 
 # ========== REST API ENDPOINTS ==========
 
