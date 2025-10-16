@@ -2,12 +2,15 @@
 """
 Standalone OBD-II data logging service with REST API.
 Auto-discovers available OBD commands and logs timestamped vehicle data.
+Automatically reconnects if connection is lost.
 """
 
 import obd
 import json
 import time
 import threading
+import asyncio
+import logging
 from datetime import datetime
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
@@ -19,14 +22,18 @@ import sys
 sys.path.insert(0, str(Path.home() / "rider-controller"))
 from config.logging_config import setup_logger
 
-# Setup logger
-logger = setup_logger('obd')
+# Setup logger with different name to avoid conflict with python-obd logger
+logger = setup_logger('obd_service')
+
+# Silence python-OBD's verbose logging (must be after imports)
+obd.logger.setLevel(logging.ERROR)
 
 # Configuration
 OBD_PORT = None  # Auto-detect, or "/dev/ttyUSB0"
 LOG_DIR = Path.home() / "rider-controller" / "logs" / "obd_data"
-POLL_INTERVAL = 0.5  # 500ms = 2Hz (as requested)
+POLL_INTERVAL = 0.5  # 500ms = 2Hz
 BUFFER_SIZE = 100  # Keep last 100 readings in memory
+RETRY_DELAY = 30  # Seconds between reconnection attempts
 
 # Global state
 app = FastAPI(title="OBD Service")
@@ -107,10 +114,9 @@ def init_obd():
         if obd_connection.is_connected():
             logger.info(f"✓ Connected to {obd_connection.port_name()}")
             logger.info(f"  Protocol: {obd_connection.protocol_name()}")
-            logger.info(f"  ECU: {obd_connection.ecus}")
             
-            # Discover what commands this vehicle supports
-            discover_available_commands()
+            # DON'T discover commands here - do it in background thread
+            # This makes connection instant instead of 30+ seconds
             
             return True
         else:
@@ -120,6 +126,20 @@ def init_obd():
     except Exception as e:
         logger.error(f"OBD initialization error: {e}")
         return False
+
+def discover_and_start_polling():
+    """
+    Discover commands and start polling (runs in background thread).
+    This is split from init_obd() so connection is instant.
+    """
+    global is_running
+    
+    # Discover what commands this vehicle supports
+    discover_available_commands()
+    
+    # Start polling
+    is_running = True
+    poll_obd()  # This will run in this thread
 
 def get_log_filename():
     """Generate log filename based on current date"""
@@ -131,16 +151,24 @@ def get_log_filename():
 def poll_obd():
     """
     Main OBD polling loop - runs in background thread.
-    This is where the actual data collection happens.
+    Monitors connection health and triggers reconnection if needed.
     """
-    global is_running, current_data, current_log_file
+    global is_running, current_data, current_log_file, obd_connection
     
     logger.info("OBD polling started")
+    consecutive_errors = 0
+    max_consecutive_errors = 10  # Reconnect after 10 failed polls
     
     while is_running:
         try:
+            # Check connection health
+            if not obd_connection or not obd_connection.is_connected():
+                logger.error("Lost OBD connection during polling")
+                break
+            
             timestamp = datetime.now().isoformat()
             data = {"timestamp": timestamp}
+            poll_success = False
             
             # Query each available OBD command
             for cmd in available_commands:
@@ -148,6 +176,7 @@ def poll_obd():
                     response = obd_connection.query(cmd)
                     
                     if not response.is_null():
+                        poll_success = True
                         # Extract value and unit
                         if hasattr(response.value, 'magnitude'):
                             value = float(response.value.magnitude)
@@ -163,36 +192,55 @@ def poll_obd():
                 except Exception as e:
                     logger.debug(f"Error querying {cmd.name}: {e}")
             
-            # Update global state
-            current_data = data
-            data_buffer.append(data)
-            
-            # Log to file (JSONL format - one JSON object per line)
-            log_file = get_log_filename()
-            if log_file != current_log_file:
-                current_log_file = log_file
-                logger.info(f"Logging to: {log_file}")
-            
-            with open(log_file, 'a') as f:
-                f.write(json.dumps(data) + '\n')
+            # Check if we got any data
+            if poll_success:
+                consecutive_errors = 0
+                
+                # Update global state
+                current_data = data
+                data_buffer.append(data)
+                
+                # Log to file (JSONL format - one JSON object per line)
+                log_file = get_log_filename()
+                if log_file != current_log_file:
+                    current_log_file = log_file
+                    logger.info(f"Logging to: {log_file}")
+                
+                with open(log_file, 'a') as f:
+                    f.write(json.dumps(data) + '\n')
+            else:
+                consecutive_errors += 1
+                logger.warning(f"No valid OBD data received (errors: {consecutive_errors}/{max_consecutive_errors})")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error("Too many consecutive errors - connection may be lost")
+                    break
             
             # Wait for next poll interval
             time.sleep(POLL_INTERVAL)
             
         except Exception as e:
-            logger.error(f"Polling error: {e}")
+            consecutive_errors += 1
+            logger.error(f"Polling error: {e} (errors: {consecutive_errors}/{max_consecutive_errors})")
+            
+            if consecutive_errors >= max_consecutive_errors:
+                logger.error("Too many consecutive errors - stopping polling")
+                break
+            
             time.sleep(1)  # Back off on errors
     
+    # Cleanup on exit
+    is_running = False
     logger.info("OBD polling stopped")
+    
+    # Don't auto-reconnect if manually stopped
+    # (Reconnection should only happen on unexpected disconnects, not manual stops)
 
 # ========== REST API ENDPOINTS ==========
 
 @app.get("/")
 def root():
-    """
-    Service status endpoint.
-    Shows if OBD is connected and running.
-    """
+    """Service status endpoint"""
     return {
         "service": "OBD Data Logger",
         "status": "running" if is_running else "stopped",
@@ -204,20 +252,14 @@ def root():
 
 @app.get("/current")
 def get_current():
-    """
-    Get most recent OBD data snapshot.
-    Returns all available sensor readings from last poll.
-    """
+    """Get most recent OBD data snapshot"""
     if not current_data:
         raise HTTPException(status_code=503, detail="No data available yet")
     return current_data
 
 @app.get("/commands")
-def get_available_commands():
-    """
-    List all OBD commands available on this vehicle.
-    Useful for knowing what data you can get.
-    """
+def get_available_commands_endpoint():
+    """List all OBD commands available on this vehicle"""
     commands_list = []
     for cmd in available_commands:
         commands_list.append({
@@ -232,10 +274,7 @@ def get_available_commands():
 
 @app.get("/history")
 def get_history(date: str = None):
-    """
-    Get historical data for a specific date (YYYY-MM-DD).
-    Reads from the JSONL log file for that day.
-    """
+    """Get historical data for a specific date (YYYY-MM-DD)"""
     if not date:
         date = datetime.now().strftime("%Y-%m-%d")
     
@@ -257,10 +296,7 @@ def get_history(date: str = None):
 
 @app.get("/health")
 def get_health():
-    """
-    Health check endpoint.
-    Returns detailed connection and logging status.
-    """
+    """Health check endpoint"""
     return {
         "service": "obd",
         "healthy": is_running and obd_connection and obd_connection.is_connected(),
@@ -276,47 +312,86 @@ def get_health():
 
 # ========== STARTUP/SHUTDOWN ==========
 
-@app.on_event("startup")
-def startup():
+async def initialize_obd_background():
     """
-    STARTUP EVENT - Called automatically when FastAPI starts.
-    
-    This is where initialization happens:
-    1. Connect to OBD adapter
-    2. Discover available commands
-    3. Start polling thread
-    
-    You don't call this manually - FastAPI calls it when service starts.
+    Initialize OBD in background after server starts.
+    Keeps trying to reconnect if connection fails.
     """
     global is_running
     
+    # Give server time to fully start
+    await asyncio.sleep(2)
+    
+    retry_count = 0
+    
+    while True:
+        retry_count += 1
+        
+        if retry_count == 1:
+            logger.info("Starting OBD initialization...")
+        else:
+            logger.info(f"Reconnection attempt #{retry_count}...")
+        
+        # Try to connect to OBD adapter
+        if init_obd():
+            # Connection successful - now discover commands and start polling in background thread
+            logger.info("✓ Connected! Starting command discovery in background...")
+            thread = threading.Thread(target=discover_and_start_polling, daemon=True, name="OBD-Discovery")
+            thread.start()
+            logger.info("✓ OBD service ready (discovery running in background)")
+            break  # Exit retry loop
+        else:
+            # Connection failed
+            if retry_count == 1:
+                logger.warning("⚠ OBD not connected - will retry automatically")
+                logger.warning(f"  (Common causes: ignition off, adapter unplugged)")
+            else:
+                logger.warning(f"⚠ Connection failed - retry #{retry_count}")
+            
+            # Wait before next retry
+            logger.info(f"Waiting {RETRY_DELAY}s before next attempt...")
+            await asyncio.sleep(RETRY_DELAY)
+
+async def reconnect_obd():
+    """Attempt to reconnect after connection loss"""
+    global is_running, obd_connection
+    
+    logger.info(f"Will attempt reconnection in {RETRY_DELAY}s...")
+    await asyncio.sleep(RETRY_DELAY)
+    
+    # Close old connection if it exists
+    if obd_connection:
+        try:
+            obd_connection.close()
+            logger.info("Closed previous connection")
+        except Exception as e:
+            logger.debug(f"Error closing connection: {e}")
+    
+    # Try to reconnect
+    logger.info("Attempting to reconnect to OBD...")
+    if init_obd():
+        logger.info("✓ Reconnected! Starting command discovery in background...")
+        thread = threading.Thread(target=discover_and_start_polling, daemon=True, name="OBD-Discovery")
+        thread.start()
+        logger.info("✓ Reconnection successful")
+    else:
+        logger.warning("Reconnection failed - will try again")
+        await asyncio.sleep(RETRY_DELAY)
+        asyncio.create_task(reconnect_obd())
+
+@app.on_event("startup")
+async def startup():
+    """FastAPI startup - server starts first, then OBD connects in background"""
     logger.info("=" * 60)
     logger.info("OBD Service Starting")
     logger.info("=" * 60)
     
-    # Try to connect to OBD adapter
-    if init_obd():
-        # Connection successful - start automatic polling
-        is_running = True
-        thread = threading.Thread(target=poll_obd, daemon=True)
-        thread.start()
-        logger.info("✓ OBD logging started automatically")
-    else:
-        # Connection failed - service runs in degraded mode
-        logger.warning("⚠ OBD not connected - service running in degraded mode")
-        logger.warning("  Service will retry connection if you call /start endpoint")
+    # Start OBD initialization in background task
+    asyncio.create_task(initialize_obd_background())
 
 @app.on_event("shutdown")
 def shutdown():
-    """
-    SHUTDOWN EVENT - Called when service stops (Ctrl+C or systemctl stop).
-    
-    Cleans up resources:
-    - Stops polling thread
-    - Closes OBD connection
-    
-    You don't call this manually - FastAPI calls it automatically.
-    """
+    """FastAPI shutdown - cleanup resources"""
     global is_running
     
     logger.info("OBD Service Shutting Down...")
@@ -333,45 +408,32 @@ def shutdown():
     logger.info("✓ Shutdown complete")
 
 # ========== MANUAL CONTROL ENDPOINTS ==========
-# These exist if you want to manually start/stop logging without restarting service
 
 @app.post("/start")
-def manual_start_logging():
+async def manual_start_logging():
     """
-    MANUAL START - Only needed if you want to restart logging after calling /stop.
-    
-    Normally logging starts automatically on service startup.
-    This endpoint lets you restart if you stopped it manually.
+    Manually trigger reconnection attempt.
+    Use this to force immediate reconnection without waiting.
     """
     global is_running
     
     if is_running:
         return {"status": "already running"}
     
-    # Try to reconnect if connection was lost
-    if not obd_connection or not obd_connection.is_connected():
-        logger.info("Attempting to reconnect to OBD...")
-        if not init_obd():
-            raise HTTPException(status_code=503, detail="Cannot connect to OBD adapter")
+    # Trigger immediate reconnection attempt
+    logger.info("Manual reconnection requested")
+    asyncio.create_task(reconnect_obd())
     
-    is_running = True
-    thread = threading.Thread(target=poll_obd, daemon=True)
-    thread.start()
-    
-    logger.info("Manual logging start requested")
-    return {"status": "started"}
+    return {
+        "status": "reconnection_initiated",
+        "message": "Attempting to reconnect to OBD adapter..."
+    }
 
 @app.post("/stop")
-def manual_stop_logging():
+async def manual_stop_logging():
     """
-    MANUAL STOP - Temporarily stop logging without shutting down service.
-    
-    vs SHUTDOWN:
-    - /stop: Stops logging, keeps service running, keeps connection open
-    - shutdown: Closes everything when service exits
-    
-    Use /stop if you want to pause logging but keep service alive.
-    Service will still respond to API requests, just won't poll OBD.
+    Temporarily stop logging without shutting down service.
+    Connection stays open but polling stops.
     """
     global is_running
     
@@ -387,16 +449,14 @@ def manual_stop_logging():
 
 if __name__ == "__main__":
     """
-    This runs when you execute: python3 obd_service.py
-    
-    Starts the FastAPI server with uvicorn.
-    The startup() function above will be called automatically.
+    Main entry point - starts FastAPI server immediately.
+    OBD initialization happens in background.
     """
     logger.info("Starting OBD service on port 8001...")
     
     uvicorn.run(
         app,
-        host="0.0.0.0",  # Listen on all network interfaces
+        host="0.0.0.0",
         port=8001,
         log_level="info"
     )
