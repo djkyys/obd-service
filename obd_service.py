@@ -34,7 +34,7 @@ OBD_PORT = None  # Auto-detect, or "/dev/ttyUSB0"
 LOG_DIR = Path.home() / "rider-controller" / "logs" / "obd_data"
 POLL_INTERVAL = 0.5  # 500ms = 2Hz
 BUFFER_SIZE = 100  # Keep last 100 readings in memory
-RETRY_DELAY = 30  # Seconds between reconnection attempts
+RETRY_DELAY = 10  # Seconds between reconnection attempts
 
 # Global state
 app = FastAPI(title="OBD Service")
