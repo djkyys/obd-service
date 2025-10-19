@@ -2,7 +2,7 @@
 """
 Standalone OBD-II data logging service with REST API.
 Auto-discovers available OBD commands and logs timestamped vehicle data.
-Automatically reconnects if connection is lost.
+NEVER GIVES UP - Automatically reconnects forever if connection is lost.
 Discovery runs in background thread for instant startup.
 """
 
@@ -35,6 +35,8 @@ LOG_DIR = Path.home() / "rider-controller" / "logs" / "obd_data"
 POLL_INTERVAL = 0.5  # 500ms = 2Hz
 BUFFER_SIZE = 100  # Keep last 100 readings in memory
 RETRY_DELAY = 10  # Seconds between reconnection attempts
+MIN_RETRY_DELAY = 5  # Minimum retry delay
+MAX_RETRY_DELAY = 30  # Maximum retry delay (can increase if needed)
 
 # Global state
 app = FastAPI(title="OBD Service")
@@ -45,17 +47,35 @@ is_running = False
 current_log_file = None
 available_commands = []  # Commands that this vehicle supports
 
+# Connection tracking
+connection_attempts = 0
+last_connection_attempt = None
+connection_state = "initializing"  # initializing, connecting, connected, disconnected, reconnecting
+last_successful_connection = None
+
+def get_retry_delay():
+    """
+    Calculate retry delay with exponential backoff (caps at MAX_RETRY_DELAY).
+    Starts at MIN_RETRY_DELAY, doubles each time, up to MAX_RETRY_DELAY.
+    """
+    global connection_attempts
+    
+    # Exponential backoff: 5s, 10s, 20s, 30s, 30s, 30s...
+    delay = min(MIN_RETRY_DELAY * (2 ** min(connection_attempts - 1, 3)), MAX_RETRY_DELAY)
+    return delay
+
 def discover_available_commands():
     """
     Test all OBD commands to see what this vehicle supports.
     This runs in background thread after connection.
     """
-    global available_commands
+    global available_commands, connection_state
     
     if not obd_connection or not obd_connection.is_connected():
         logger.error("Cannot discover commands - not connected")
         return
     
+    connection_state = "discovering"
     logger.info("Discovering available OBD commands (this may take 30+ seconds)...")
     
     # Get all available OBD commands from python-OBD library
@@ -103,29 +123,46 @@ def discover_available_commands():
         }, f, indent=2)
     
     logger.info(f"Command list saved to: {discovery_file}")
+    connection_state = "connected"
 
 def init_obd():
     """Initialize OBD connection (fast - no discovery)"""
-    global obd_connection
+    global obd_connection, connection_attempts, last_connection_attempt, connection_state
+    
+    connection_attempts += 1
+    last_connection_attempt = datetime.now()
+    connection_state = "connecting"
     
     try:
+        logger.info(f"Connection attempt #{connection_attempts}...")
         logger.info("Connecting to OBD-II adapter...")
+        
+        # Close old connection if exists
+        if obd_connection:
+            try:
+                obd_connection.close()
+            except Exception as e:
+                logger.debug(f"Error closing old connection: {e}")
+        
         obd_connection = obd.OBD(OBD_PORT, fast=False)
         
         if obd_connection.is_connected():
             logger.info(f"✓ Connected to {obd_connection.port_name()}")
             logger.info(f"  Protocol: {obd_connection.protocol_name()}")
+            connection_state = "connected"
             
             # Don't discover commands here - do it in background thread
             # This makes connection instant instead of 30+ seconds
             
             return True
         else:
-            logger.error("✗ Failed to connect to OBD-II adapter")
+            logger.warning("✗ Failed to connect to OBD-II adapter")
+            connection_state = "disconnected"
             return False
             
     except Exception as e:
         logger.error(f"OBD initialization error: {e}")
+        connection_state = "disconnected"
         return False
 
 def discover_and_start_polling():
@@ -133,10 +170,13 @@ def discover_and_start_polling():
     Discover commands and start polling (runs in background thread).
     This is split from init_obd() so connection is instant.
     """
-    global is_running
+    global is_running, last_successful_connection
     
     # Discover what commands this vehicle supports
     discover_available_commands()
+    
+    # Mark successful connection
+    last_successful_connection = datetime.now()
     
     # Start polling
     is_running = True
@@ -153,8 +193,9 @@ def poll_obd():
     """
     Main OBD polling loop - runs in background thread.
     Monitors connection health and triggers reconnection if needed.
+    NEVER EXITS - Always triggers reconnection if connection lost.
     """
-    global is_running, current_data, current_log_file, obd_connection
+    global is_running, current_data, current_log_file, obd_connection, connection_state
     
     logger.info("OBD polling started")
     consecutive_errors = 0
@@ -165,6 +206,7 @@ def poll_obd():
             # Check connection health
             if not obd_connection or not obd_connection.is_connected():
                 logger.error("Lost OBD connection during polling")
+                connection_state = "disconnected"
                 break
             
             timestamp = datetime.now().isoformat()
@@ -196,6 +238,7 @@ def poll_obd():
             # Check if we got any data
             if poll_success:
                 consecutive_errors = 0
+                connection_state = "connected"
                 
                 # Update global state
                 current_data = data
@@ -215,6 +258,7 @@ def poll_obd():
                 
                 if consecutive_errors >= max_consecutive_errors:
                     logger.error("Too many consecutive errors - connection may be lost")
+                    connection_state = "disconnected"
                     break
             
             # Wait for next poll interval
@@ -226,13 +270,25 @@ def poll_obd():
             
             if consecutive_errors >= max_consecutive_errors:
                 logger.error("Too many consecutive errors - stopping polling")
+                connection_state = "disconnected"
                 break
             
             time.sleep(1)  # Back off on errors
     
-    # Cleanup on exit
+    # Connection lost - trigger reconnection
     is_running = False
-    logger.info("OBD polling stopped")
+    connection_state = "reconnecting"
+    logger.info("OBD polling stopped - will attempt reconnection")
+    
+    # Schedule reconnection in background
+    asyncio.run(schedule_reconnection())
+
+async def schedule_reconnection():
+    """Schedule reconnection attempt after delay"""
+    retry_delay = get_retry_delay()
+    logger.info(f"Scheduling reconnection in {retry_delay}s...")
+    await asyncio.sleep(retry_delay)
+    asyncio.create_task(reconnect_obd())
 
 # ========== REST API ENDPOINTS ==========
 
@@ -245,7 +301,11 @@ def root():
         "connected": obd_connection.is_connected() if obd_connection else False,
         "port": obd_connection.port_name() if obd_connection and obd_connection.is_connected() else None,
         "available_commands": len(available_commands),
-        "poll_interval": POLL_INTERVAL
+        "poll_interval": POLL_INTERVAL,
+        "connection_state": connection_state,
+        "connection_attempts": connection_attempts,
+        "last_attempt": last_connection_attempt.isoformat() if last_connection_attempt else None,
+        "last_successful": last_successful_connection.isoformat() if last_successful_connection else None
     }
 
 @app.get("/current")
@@ -305,7 +365,42 @@ def get_health():
             (datetime.now() - datetime.fromisoformat(current_data['timestamp'])).total_seconds()
             if current_data and 'timestamp' in current_data
             else None
+        ),
+        "connection_state": connection_state,
+        "connection_attempts": connection_attempts,
+        "time_since_last_attempt": (
+            (datetime.now() - last_connection_attempt).total_seconds()
+            if last_connection_attempt else None
+        ),
+        "time_since_last_success": (
+            (datetime.now() - last_successful_connection).total_seconds()
+            if last_successful_connection else None
         )
+    }
+
+@app.get("/connection/status")
+def get_connection_status():
+    """Detailed connection status and retry information"""
+    next_retry_in = None
+    
+    if connection_state in ["disconnected", "reconnecting"] and last_connection_attempt:
+        elapsed = (datetime.now() - last_connection_attempt).total_seconds()
+        retry_delay = get_retry_delay()
+        next_retry_in = max(0, retry_delay - elapsed)
+    
+    return {
+        "state": connection_state,
+        "connected": obd_connection.is_connected() if obd_connection else False,
+        "attempts": connection_attempts,
+        "last_attempt": last_connection_attempt.isoformat() if last_connection_attempt else None,
+        "last_success": last_successful_connection.isoformat() if last_successful_connection else None,
+        "next_retry_in_seconds": next_retry_in,
+        "retry_policy": {
+            "min_delay": MIN_RETRY_DELAY,
+            "max_delay": MAX_RETRY_DELAY,
+            "current_delay": get_retry_delay(),
+            "strategy": "exponential_backoff"
+        }
     }
 
 # ========== STARTUP/SHUTDOWN ==========
@@ -313,49 +408,70 @@ def get_health():
 async def initialize_obd_background():
     """
     Initialize OBD in background after server starts.
-    Keeps trying to reconnect if connection fails.
+    NEVER STOPS TRYING - Keeps trying forever if connection fails.
     """
-    global is_running
+    global is_running, connection_state
     
     # Give server time to fully start
     await asyncio.sleep(2)
     
-    retry_count = 0
+    logger.info("=" * 60)
+    logger.info("OBD Connection Manager Started")
+    logger.info("Will keep trying to connect indefinitely")
+    logger.info("=" * 60)
     
+    # Infinite retry loop
     while True:
-        retry_count += 1
-        
-        if retry_count == 1:
-            logger.info("Starting OBD initialization...")
+        if connection_attempts == 0:
+            logger.info("Starting initial OBD connection attempt...")
         else:
-            logger.info(f"Reconnection attempt #{retry_count}...")
+            retry_delay = get_retry_delay()
+            logger.info(f"Retry #{connection_attempts} in {retry_delay}s...")
+            logger.info(f"  (Exponential backoff: {MIN_RETRY_DELAY}s → {MAX_RETRY_DELAY}s)")
+            await asyncio.sleep(retry_delay)
         
         # Try to connect to OBD adapter
         if init_obd():
-            # Connection successful - now discover commands and start polling in background thread
+            # Connection successful - reset attempt counter for future reconnections
             logger.info("✓ Connected! Starting command discovery in background...")
-            thread = threading.Thread(target=discover_and_start_polling, daemon=True, name="OBD-Discovery")
+            
+            # Start discovery and polling in background thread
+            thread = threading.Thread(
+                target=discover_and_start_polling, 
+                daemon=True, 
+                name="OBD-Discovery"
+            )
             thread.start()
+            
             logger.info("✓ OBD service ready (discovery running in background)")
-            break  # Exit retry loop
+            
+            # Wait for this thread to signal disconnection
+            while connection_state not in ["disconnected", "reconnecting"]:
+                await asyncio.sleep(1)
+            
+            # Connection lost - continue retry loop
+            logger.warning("⚠ Connection lost - will retry")
+            
         else:
             # Connection failed
-            if retry_count == 1:
-                logger.warning("⚠ OBD not connected - will retry automatically")
-                logger.warning(f"  (Common causes: ignition off, adapter unplugged)")
+            if connection_attempts == 1:
+                logger.warning("⚠ Initial connection failed")
+                logger.warning("  Common causes:")
+                logger.warning("    • Vehicle ignition is OFF")
+                logger.warning("    • OBD adapter not plugged in")
+                logger.warning("    • USB cable issue")
+                logger.warning("  Will keep trying automatically...")
             else:
-                logger.warning(f"⚠ Connection failed - retry #{retry_count}")
-            
-            # Wait before next retry
-            logger.info(f"Waiting {RETRY_DELAY}s before next attempt...")
-            await asyncio.sleep(RETRY_DELAY)
+                logger.warning(f"⚠ Connection attempt #{connection_attempts} failed")
 
 async def reconnect_obd():
-    """Attempt to reconnect after connection loss"""
-    global is_running, obd_connection
+    """
+    Attempt to reconnect after connection loss.
+    This is called from poll_obd() when connection is lost.
+    """
+    global is_running, obd_connection, connection_attempts
     
-    logger.info(f"Will attempt reconnection in {RETRY_DELAY}s...")
-    await asyncio.sleep(RETRY_DELAY)
+    logger.info("Reconnection triggered after connection loss")
     
     # Close old connection if it exists
     if obd_connection:
@@ -365,16 +481,27 @@ async def reconnect_obd():
         except Exception as e:
             logger.debug(f"Error closing connection: {e}")
     
-    # Try to reconnect
-    logger.info("Attempting to reconnect to OBD...")
+    # Reset for new connection attempt
+    obd_connection = None
+    
+    # Try to reconnect (will continue indefinitely via initialize_obd_background loop)
+    retry_delay = get_retry_delay()
+    logger.info(f"Will attempt reconnection in {retry_delay}s...")
+    await asyncio.sleep(retry_delay)
+    
     if init_obd():
         logger.info("✓ Reconnected! Starting command discovery in background...")
-        thread = threading.Thread(target=discover_and_start_polling, daemon=True, name="OBD-Discovery")
+        thread = threading.Thread(
+            target=discover_and_start_polling, 
+            daemon=True, 
+            name="OBD-Discovery"
+        )
         thread.start()
         logger.info("✓ Reconnection successful")
     else:
         logger.warning("Reconnection failed - will try again")
-        await asyncio.sleep(RETRY_DELAY)
+        # Schedule another attempt
+        await asyncio.sleep(get_retry_delay())
         asyncio.create_task(reconnect_obd())
 
 @app.on_event("startup")
@@ -385,6 +512,7 @@ async def startup():
     logger.info("=" * 60)
     
     # Start OBD initialization in background task
+    # This will NEVER STOP trying to connect
     asyncio.create_task(initialize_obd_background())
 
 @app.on_event("shutdown")
@@ -410,21 +538,23 @@ def shutdown():
 @app.post("/start")
 async def manual_start_logging():
     """
-    Manually trigger reconnection attempt.
-    Use this to force immediate reconnection without waiting.
+    Manually trigger immediate reconnection attempt.
+    Bypasses exponential backoff delay.
     """
-    global is_running
+    global is_running, connection_attempts
     
     if is_running:
         return {"status": "already running"}
     
-    # Trigger immediate reconnection attempt
-    logger.info("Manual reconnection requested")
+    # Reset backoff counter for immediate retry
+    logger.info("Manual reconnection requested - attempting immediately")
+    connection_attempts = 0
+    
     asyncio.create_task(reconnect_obd())
     
     return {
         "status": "reconnection_initiated",
-        "message": "Attempting to reconnect to OBD adapter..."
+        "message": "Attempting to reconnect to OBD adapter immediately..."
     }
 
 @app.post("/stop")
@@ -432,6 +562,7 @@ async def manual_stop_logging():
     """
     Temporarily stop logging without shutting down service.
     Connection stays open but polling stops.
+    Auto-reconnection is DISABLED when manually stopped.
     """
     global is_running
     
@@ -439,18 +570,25 @@ async def manual_stop_logging():
         return {"status": "already stopped"}
     
     is_running = False
-    logger.info("Manual logging stop requested")
+    logger.info("Manual logging stop requested - auto-reconnection DISABLED")
+    logger.info("Call POST /start to resume")
     
-    return {"status": "stopped"}
+    return {
+        "status": "stopped",
+        "message": "Logging stopped. Auto-reconnection disabled. Call POST /start to resume."
+    }
 
 # ========== MAIN ENTRY POINT ==========
 
 if __name__ == "__main__":
     """
     Main entry point - starts FastAPI server immediately.
-    OBD initialization happens in background.
+    OBD initialization happens in background and NEVER GIVES UP.
     """
-    logger.info("Starting OBD service on port 8001...")
+    logger.info("=" * 60)
+    logger.info("OBD Service with Infinite Retry")
+    logger.info("Starting on port 8001...")
+    logger.info("=" * 60)
     
     uvicorn.run(
         app,
