@@ -2,6 +2,7 @@
 """
 Standalone OBD-II data logging service with REST API.
 Auto-discovers available OBD commands and logs timestamped vehicle data.
+ONLY LOGS WHEN A SESSION IS ACTIVE - requires session_id to start logging.
 NEVER GIVES UP - Automatically reconnects forever if connection is lost.
 Discovery runs in background thread for instant startup.
 """
@@ -15,6 +16,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 import uvicorn
 from collections import deque
 import sys
@@ -47,11 +49,20 @@ is_running = False
 current_log_file = None
 available_commands = []  # Commands that this vehicle supports
 
+# Session management
+current_session_id = None  # None = not logging, String = active session
+session_start_time = None
+session_data_count = 0
+
 # Connection tracking
 connection_attempts = 0
 last_connection_attempt = None
 connection_state = "initializing"  # initializing, connecting, connected, disconnected, reconnecting
 last_successful_connection = None
+
+# Request models
+class SessionStart(BaseModel):
+    session_id: str
 
 def get_retry_delay():
     """
@@ -183,21 +194,26 @@ def discover_and_start_polling():
     poll_obd()  # This will run in this thread
 
 def get_log_filename():
-    """Generate log filename based on current date"""
-    now = datetime.now()
-    date_str = now.strftime("%Y-%m-%d")
+    """Generate log filename based on session ID"""
+    global current_session_id
+    
+    if not current_session_id:
+        return None
+    
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    return LOG_DIR / f"obd_{date_str}.jsonl"
+    return LOG_DIR / f"session_{current_session_id}.jsonl"
 
 def poll_obd():
     """
     Main OBD polling loop - runs in background thread.
     Monitors connection health and triggers reconnection if needed.
+    ALWAYS POLLS but only LOGS when session is active.
     NEVER EXITS - Always triggers reconnection if connection lost.
     """
     global is_running, current_data, current_log_file, obd_connection, connection_state
+    global session_data_count
     
-    logger.info("OBD polling started")
+    logger.info("OBD polling started (logging only when session active)")
     consecutive_errors = 0
     max_consecutive_errors = 10  # Reconnect after 10 failed polls
     
@@ -240,18 +256,25 @@ def poll_obd():
                 consecutive_errors = 0
                 connection_state = "connected"
                 
-                # Update global state
+                # Always update in-memory state
                 current_data = data
                 data_buffer.append(data)
                 
-                # Log to file (JSONL format - one JSON object per line)
-                log_file = get_log_filename()
-                if log_file != current_log_file:
-                    current_log_file = log_file
-                    logger.info(f"Logging to: {log_file}")
-                
-                with open(log_file, 'a') as f:
-                    f.write(json.dumps(data) + '\n')
+                # Only log to file if session is active
+                if current_session_id:
+                    log_file = get_log_filename()
+                    if log_file != current_log_file:
+                        current_log_file = log_file
+                        logger.info(f"Logging to: {log_file}")
+                    
+                    # Add session_id to logged data
+                    data_with_session = data.copy()
+                    data_with_session["session_id"] = current_session_id
+                    
+                    with open(log_file, 'a') as f:
+                        f.write(json.dumps(data_with_session) + '\n')
+                    
+                    session_data_count += 1
             else:
                 consecutive_errors += 1
                 logger.warning(f"No valid OBD data received (errors: {consecutive_errors}/{max_consecutive_errors})")
@@ -262,7 +285,7 @@ def poll_obd():
                     break
             
             # Wait for next poll interval
-            time.sleep(POLL_INTERVAL)
+            # time.sleep(POLL_INTERVAL)  # DISABLED - running at max speed
             
         except Exception as e:
             consecutive_errors += 1
@@ -305,7 +328,13 @@ def root():
         "connection_state": connection_state,
         "connection_attempts": connection_attempts,
         "last_attempt": last_connection_attempt.isoformat() if last_connection_attempt else None,
-        "last_successful": last_successful_connection.isoformat() if last_successful_connection else None
+        "last_successful": last_successful_connection.isoformat() if last_successful_connection else None,
+        "session": {
+            "active": current_session_id is not None,
+            "session_id": current_session_id,
+            "start_time": session_start_time.isoformat() if session_start_time else None,
+            "data_points_logged": session_data_count
+        }
     }
 
 @app.get("/current")
@@ -330,15 +359,83 @@ def get_available_commands_endpoint():
         "commands": commands_list
     }
 
-@app.get("/history")
-def get_history(date: str = None):
-    """Get historical data for a specific date (YYYY-MM-DD)"""
-    if not date:
-        date = datetime.now().strftime("%Y-%m-%d")
+@app.get("/session")
+def get_session_status():
+    """Get current session status"""
+    return {
+        "active": current_session_id is not None,
+        "session_id": current_session_id,
+        "start_time": session_start_time.isoformat() if session_start_time else None,
+        "data_points_logged": session_data_count,
+        "log_file": str(get_log_filename()) if current_session_id else None
+    }
+
+@app.post("/session/start")
+async def start_session(request: SessionStart):
+    """Start a new logging session with given session_id"""
+    global current_session_id, session_start_time, session_data_count, current_log_file
     
-    log_file = LOG_DIR / f"obd_{date}.jsonl"
+    if current_session_id:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Session already active: {current_session_id}. Stop it first."
+        )
+    
+    if not request.session_id or not request.session_id.strip():
+        raise HTTPException(status_code=400, detail="session_id cannot be empty")
+    
+    # Sanitize session_id for filesystem
+    session_id = "".join(c for c in request.session_id if c.isalnum() or c in ('-', '_'))
+    
+    current_session_id = session_id
+    session_start_time = datetime.now()
+    session_data_count = 0
+    current_log_file = None  # Will be set on first write
+    
+    logger.info(f"✓ Logging session started: {session_id}")
+    
+    return {
+        "status": "session_started",
+        "session_id": current_session_id,
+        "start_time": session_start_time.isoformat(),
+        "log_file": str(get_log_filename())
+    }
+
+@app.post("/session/stop")
+async def stop_session():
+    """Stop the current logging session"""
+    global current_session_id, session_start_time, session_data_count, current_log_file
+    
+    if not current_session_id:
+        raise HTTPException(status_code=400, detail="No active session")
+    
+    session_id = current_session_id
+    duration = (datetime.now() - session_start_time).total_seconds() if session_start_time else 0
+    data_count = session_data_count
+    log_file = current_log_file
+    
+    # Clear session state
+    current_session_id = None
+    session_start_time = None
+    session_data_count = 0
+    current_log_file = None
+    
+    logger.info(f"✓ Logging session stopped: {session_id} ({data_count} data points)")
+    
+    return {
+        "status": "session_stopped",
+        "session_id": session_id,
+        "duration_seconds": duration,
+        "data_points_logged": data_count,
+        "log_file": str(log_file) if log_file else None
+    }
+
+@app.get("/history/{session_id}")
+def get_session_history(session_id: str):
+    """Get historical data for a specific session"""
+    log_file = LOG_DIR / f"session_{session_id}.jsonl"
     if not log_file.exists():
-        raise HTTPException(status_code=404, detail=f"No data for {date}")
+        raise HTTPException(status_code=404, detail=f"No data for session: {session_id}")
     
     # Read JSONL file (one JSON object per line)
     data = []
@@ -347,10 +444,40 @@ def get_history(date: str = None):
             data.append(json.loads(line))
     
     return {
-        "date": date,
+        "session_id": session_id,
         "count": len(data),
         "data": data
     }
+
+@app.get("/sessions")
+def list_sessions():
+    """List all available session log files"""
+    if not LOG_DIR.exists():
+        return {"sessions": []}
+    
+    sessions = []
+    for log_file in LOG_DIR.glob("session_*.jsonl"):
+        session_id = log_file.stem.replace("session_", "")
+        
+        # Get file stats
+        stat = log_file.stat()
+        
+        # Count lines (data points)
+        with open(log_file, 'r') as f:
+            line_count = sum(1 for _ in f)
+        
+        sessions.append({
+            "session_id": session_id,
+            "filename": log_file.name,
+            "size_bytes": stat.st_size,
+            "data_points": line_count,
+            "modified": datetime.fromtimestamp(stat.st_mtime).isoformat()
+        })
+    
+    # Sort by modification time, newest first
+    sessions.sort(key=lambda x: x["modified"], reverse=True)
+    
+    return {"sessions": sessions}
 
 @app.get("/health")
 def get_health():
@@ -360,6 +487,7 @@ def get_health():
         "healthy": is_running and obd_connection and obd_connection.is_connected(),
         "connected": obd_connection.is_connected() if obd_connection else False,
         "logging": is_running,
+        "session_active": current_session_id is not None,
         "samples_collected": len(data_buffer),
         "last_sample_age_seconds": (
             (datetime.now() - datetime.fromisoformat(current_data['timestamp'])).total_seconds()
@@ -508,7 +636,7 @@ async def reconnect_obd():
 async def startup():
     """FastAPI startup - server starts first, then OBD connects in background"""
     logger.info("=" * 60)
-    logger.info("OBD Service Starting")
+    logger.info("OBD Service Starting (Session-Based Logging)")
     logger.info("=" * 60)
     
     # Start OBD initialization in background task
@@ -518,9 +646,14 @@ async def startup():
 @app.on_event("shutdown")
 def shutdown():
     """FastAPI shutdown - cleanup resources"""
-    global is_running
+    global is_running, current_session_id
     
     logger.info("OBD Service Shutting Down...")
+    
+    # Auto-stop session if active
+    if current_session_id:
+        logger.info(f"Auto-stopping active session: {current_session_id}")
+        current_session_id = None
     
     # Stop polling loop
     is_running = False
@@ -586,7 +719,7 @@ if __name__ == "__main__":
     OBD initialization happens in background and NEVER GIVES UP.
     """
     logger.info("=" * 60)
-    logger.info("OBD Service with Infinite Retry")
+    logger.info("OBD Service with Session-Based Logging")
     logger.info("Starting on port 8001...")
     logger.info("=" * 60)
     
